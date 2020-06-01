@@ -21,41 +21,19 @@
 
 llvm::ExitOnError ExitOnErr;
 
-bool verifyFunction(llvm::Function *jit_func){
-	std::string str;
-	llvm::raw_string_ostream os(str);
-	bool failed = llvm::verifyFunction(*jit_func, &os);
-	if(failed){
-		fprintf(stderr, "\nfunction verifier:\n%s\n", os.str().c_str());
-	}
-	return !failed;
-}
 
-int main(){
-	// initialize LLVM
-	llvm::InitializeNativeTarget();
-	llvm::InitializeNativeTargetAsmPrinter();
-
-	using SumFunc = int64_t (*)(const int64_t *arr, size_t count);
-	std::unique_ptr<llvm::orc::LLJIT> J;
-	SumFunc fn=nullptr;
-	{ // scope to test life-cycles
-
-	auto Context = std::make_unique<llvm::LLVMContext>();
-	auto M = std::make_unique<llvm::Module>("test", *Context);
-
-
+llvm::Function *generateFunction(llvm::LLVMContext &Context, llvm::Module &M){
 	// emit LLVM IR
-	llvm::Type *int64_type = llvm::Type::getInt64Ty(*Context);
-	llvm::Type *int64_ptr_type = llvm::Type::getInt64PtrTy(*Context);
+	llvm::Type *int64_type = llvm::Type::getInt64Ty(Context);
+	llvm::Type *int64_ptr_type = llvm::Type::getInt64PtrTy(Context);
 
 	// Signature of the generated function.
 	llvm::FunctionType *jit_func_type = llvm::FunctionType::get(int64_type, {int64_ptr_type, int64_type}, false);
-	llvm::Function *jit_func = llvm::Function::Create(jit_func_type, llvm::Function::ExternalLinkage, "sumfunc", M.get());
+	llvm::Function *jit_func = llvm::Function::Create(jit_func_type, llvm::Function::ExternalLinkage, "sumfunc", M);
 
-	llvm::BasicBlock *check_bb = llvm::BasicBlock::Create(*Context, "check", jit_func);
-	llvm::BasicBlock *loop_bb = llvm::BasicBlock::Create(*Context, "loop", jit_func);
-	llvm::BasicBlock *exit_bb = llvm::BasicBlock::Create(*Context, "exit", jit_func);
+	llvm::BasicBlock *check_bb = llvm::BasicBlock::Create(Context, "check", jit_func);
+	llvm::BasicBlock *loop_bb = llvm::BasicBlock::Create(Context, "loop", jit_func);
+	llvm::BasicBlock *exit_bb = llvm::BasicBlock::Create(Context, "exit", jit_func);
 	llvm::IRBuilder<> builder(check_bb);
 	// function arguments
 	llvm::Function::arg_iterator args = jit_func->arg_begin();
@@ -106,16 +84,45 @@ int main(){
 	// set return value
 	builder.CreateRet(phi_ret);
 
+	return jit_func;
+}
+
+
+bool verifyFunction(llvm::Function *jit_func){
+	std::string str;
+	llvm::raw_string_ostream os(str);
+	bool failed = llvm::verifyFunction(*jit_func, &os);
+	if(failed){
+		fprintf(stderr, "\nfunction verifier:\n%s\n", os.str().c_str());
+	}
+	return !failed;
+}
+
+void printIR(const llvm::Module &M, const char *fname){
+	std::string str;
+	llvm::raw_string_ostream os(str);
+	M.print(os, nullptr);
+	std::ofstream of(fname);
+	of << os.str();
+}
+
+int main(){
+	// initialize LLVM
+	llvm::InitializeNativeTarget();
+	llvm::InitializeNativeTargetAsmPrinter();
+
+	using SumFunc = int64_t (*)(const int64_t *arr, size_t count);
+	std::unique_ptr<llvm::orc::LLJIT> J;
+	SumFunc fn=nullptr;
+	{ // scope to test life-cycles
+
+	auto Context = std::make_unique<llvm::LLVMContext>();
+	auto M = std::make_unique<llvm::Module>("test", *Context);
+
+	llvm::Function *jit_func = generateFunction(*Context, *M);
 
 	// print
-	{
-		std::string str;
-		llvm::raw_string_ostream os(str);
-		M->print(os, nullptr);
-		std::ofstream of("sum.ll");
-		of << os.str();
-	}
-
+	printIR(*M, "sum.ll");
 	// verify
 	verifyFunction(jit_func);
 
@@ -148,13 +155,7 @@ int main(){
 			module_pm.run(*M);
 
 	// print
-	{
-		std::string str;
-		llvm::raw_string_ostream os(str);
-		M->print(os, nullptr);
-		std::ofstream of("sum_opt.ll");
-		of << os.str();
-	}
+	printIR(*M, "sum_opt.ll");
 #endif
 
 	//auto J = ExitOnErr(

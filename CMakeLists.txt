@@ -29,3 +29,6 @@ include_directories(${LLVM_INCLUDE_DIR})
 
 add_executable(sum sum.cpp)
 target_link_libraries(sum ${LLVM_LIBRARIES})
+
+add_executable(sumDebug sumDebug.cpp)
+target_link_libraries(sumDebug ${LLVM_LIBRARIES})

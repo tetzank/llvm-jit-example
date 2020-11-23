@@ -3,12 +3,10 @@
 #include <numeric>
 #include <vector>
 
+#include "llvmjitrt.hpp"
+
 #include <llvm/Support/TargetSelect.h> // InitializeNativeTarget
 #include <llvm/Support/raw_ostream.h>
-#include <llvm/ExecutionEngine/Orc/LLJIT.h>
-#include <llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h>
-#include <llvm/ExecutionEngine/JITEventListener.h>
-#include <llvm/ExecutionEngine/SectionMemoryManager.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/LegacyPassManager.h> // for optimizations
@@ -165,99 +163,65 @@ void printIR(const llvm::Module &M, const char *fname){
 	of << os.str();
 }
 
+void optimize(int optLevel, llvm::Module *M, llvm::Function *function){
+	//TODO: use TransformLayer instead
+	llvm::PassManagerBuilder pm_builder;
+	pm_builder.OptLevel = optLevel;
+	pm_builder.SizeLevel = 0;
+	//pm_builder.Inliner = llvm::createAlwaysInlinerLegacyPass();
+	pm_builder.Inliner = llvm::createFunctionInliningPass(optLevel, 0, false);
+	pm_builder.LoopVectorize = true;
+	pm_builder.SLPVectorize = true;
+
+	//pm_builder.VerifyInput = true;
+	pm_builder.VerifyOutput = true;
+
+	llvm::legacy::FunctionPassManager function_pm(M);
+	llvm::legacy::PassManager module_pm;
+	pm_builder.populateFunctionPassManager(function_pm);
+	pm_builder.populateModulePassManager(module_pm);
+
+	function_pm.doInitialization();
+	//for(llvm::Function *f : functions){
+	//	function_pm.run(*f);
+	//}
+	function_pm.run(*function);
+
+	module_pm.run(*M);
+}
+
 int main(){
 	// initialize LLVM
 	llvm::InitializeNativeTarget();
 	llvm::InitializeNativeTargetAsmPrinter();
 
 	using SumFunc = int64_t (*)(const int64_t *arr, size_t count);
-	std::unique_ptr<llvm::orc::LLJIT> J;
+	llvmjitrt llvmrt;
 	SumFunc fn=nullptr;
 	{ // scope to test life-cycles
+		auto Context = std::make_unique<llvm::LLVMContext>();
+		auto M = std::make_unique<llvm::Module>("test", *Context);
 
-	auto Context = std::make_unique<llvm::LLVMContext>();
-	auto M = std::make_unique<llvm::Module>("test", *Context);
+		llvm::Function *jit_func = generateFunction(*Context, *M);
 
-	llvm::Function *jit_func = generateFunction(*Context, *M);
+		// print
+		printIR(*M, "sumDebug.ll");
+		// verify
+		verifyFunction(jit_func);
 
-	// print
-	printIR(*M, "sumDebug.ll");
-	// verify
-	verifyFunction(jit_func);
-
-#if 0
-	int optLevel = 3;
-
-	//TODO: use TransformLayer instead
-			llvm::PassManagerBuilder pm_builder;
-			pm_builder.OptLevel = optLevel;
-			pm_builder.SizeLevel = 0;
-			//pm_builder.Inliner = llvm::createAlwaysInlinerLegacyPass();
-			pm_builder.Inliner = llvm::createFunctionInliningPass(optLevel, 0, false);
-			pm_builder.LoopVectorize = true;
-			pm_builder.SLPVectorize = true;
-
-			//pm_builder.VerifyInput = true;
-			pm_builder.VerifyOutput = true;
-
-			llvm::legacy::FunctionPassManager function_pm(M.get());
-			llvm::legacy::PassManager module_pm;
-			pm_builder.populateFunctionPassManager(function_pm);
-			pm_builder.populateModulePassManager(module_pm);
-
-			function_pm.doInitialization();
-			//for(llvm::Function *f : functions){
-			//	function_pm.run(*f);
-			//}
-			function_pm.run(*jit_func);
-
-			module_pm.run(*M);
-
-	// print
-	printIR(*M, "sumDebug_opt.ll");
+#if 1
+		optimize(3, M.get(), jit_func);
+		// print
+		printIR(*M, "sumDebug_opt.ll");
 #endif
 
-	//auto J = ExitOnErr(
-	//std::unique_ptr<llvm::orc::LLJIT> J = ExitOnErr(
-	J = ExitOnErr(
-		llvm::orc::LLJITBuilder()
-			.setJITTargetMachineBuilder(cantFail(llvm::orc::JITTargetMachineBuilder::detectHost()))
-			.setCompileFunctionCreator([&](llvm::orc::JITTargetMachineBuilder JTMB)
-				-> llvm::Expected<std::unique_ptr<llvm::orc::IRCompileLayer::IRCompiler>>
-			{
-				auto TM = JTMB.createTargetMachine();
-				if (!TM) return TM.takeError();
-				return std::make_unique<llvm::orc::TMOwningSimpleCompiler>(std::move(*TM));
-			})
-			.setObjectLinkingLayerCreator([&](llvm::orc::ExecutionSession &ES, const llvm::Triple &TT) {
-				auto GetMemMgr = []() {
-					return std::make_unique<llvm::SectionMemoryManager>();
-				};
-				auto ObjLinkingLayer = std::make_unique<llvm::orc::RTDyldObjectLinkingLayer>(
-					ES, std::move(GetMemMgr)
-				);
-				ObjLinkingLayer->registerJITEventListener(
-					*llvm::JITEventListener::createGDBRegistrationListener()
-				);
-				llvm::JITEventListener *perfListener = llvm::JITEventListener::createPerfJITEventListener();
-				// is nullptr without LLVM_USE_PERF when compiling LLVM
-				assert(perfListener);
-				ObjLinkingLayer->registerJITEventListener(*perfListener);
-				return ObjLinkingLayer;
-			})
-			.create()
-	);
-	// dumps object files to current working directory (directory can be changed by parameter)
-    J->getObjTransformLayer().setTransform(llvm::orc::DumpObjects());
-
-	llvm::orc::ThreadSafeModule tsm(std::move(M), std::move(Context));
-	ExitOnErr(J->addIRModule(std::move(tsm)));
-	// Look up the JIT'd function
-	//auto SumSym = ExitOnErr(J->lookup("sumfunc"));
-	llvm::JITEvaluatedSymbol SumSym = ExitOnErr(J->lookup("sumfunc"));
-	// get function ptr
-	/*SumFunc*/ fn = (SumFunc)SumSym.getAddress();
-
+		llvm::orc::ThreadSafeModule tsm(std::move(M), std::move(Context));
+		ExitOnErr(llvmrt.J->addIRModule(std::move(tsm)));
+		// Look up the JIT'd function
+		//auto SumSym = ExitOnErr(J->lookup("sumfunc"));
+		llvm::JITEvaluatedSymbol SumSym = ExitOnErr(llvmrt.J->lookup("sumfunc"));
+		// get function ptr
+		/*SumFunc*/ fn = (SumFunc)SumSym.getAddress();
 	} // scope end
 
 	// generate some data

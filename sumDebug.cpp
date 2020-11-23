@@ -22,17 +22,76 @@
 llvm::ExitOnError ExitOnErr;
 
 
-llvm::Function *generateFunction(llvm::LLVMContext &Context, llvm::Module &M){
+class Function{
+public:
+	std::unique_ptr<llvm::LLVMContext> Context; //FIXME: make private
+	std::unique_ptr<llvm::Module> M;            //FIXME: make private
+	llvm::Function *jit_function;               //FIXME: make private
+
+	Function()
+		: Context(std::make_unique<llvm::LLVMContext>())
+		, M(std::make_unique<llvm::Module>("test", *Context)) //FIXME: hardcoded
+	{}
+
+	void optimize(int optLevel){
+		//TODO: use TransformLayer instead
+		llvm::PassManagerBuilder pm_builder;
+		pm_builder.OptLevel = optLevel;
+		pm_builder.SizeLevel = 0;
+		//pm_builder.Inliner = llvm::createAlwaysInlinerLegacyPass();
+		pm_builder.Inliner = llvm::createFunctionInliningPass(optLevel, 0, false);
+		pm_builder.LoopVectorize = true;
+		pm_builder.SLPVectorize = true;
+
+		//pm_builder.VerifyInput = true;
+		pm_builder.VerifyOutput = true;
+
+		llvm::legacy::FunctionPassManager function_pm(M.get());
+		llvm::legacy::PassManager module_pm;
+		pm_builder.populateFunctionPassManager(function_pm);
+		pm_builder.populateModulePassManager(module_pm);
+
+		function_pm.doInitialization();
+		//for(llvm::Function *f : functions){
+		//	function_pm.run(*f);
+		//}
+		function_pm.run(*jit_function);
+
+		module_pm.run(*M);
+	}
+
+	void printIR(const char *fname){
+		std::string str;
+		llvm::raw_string_ostream os(str);
+		M->print(os, nullptr);
+		std::ofstream of(fname);
+		of << os.str();
+	}
+
+	bool verify(){
+		std::string str;
+		llvm::raw_string_ostream os(str);
+		bool failed = llvm::verifyFunction(*jit_function, &os);
+		if(failed){
+			fprintf(stderr, "\nfunction verifier:\n%s\n", os.str().c_str());
+		}
+		return !failed;
+	}
+};
+
+
+
+void generateFunction(Function &function){
 	// setup debug information
-	llvm::DIBuilder dibuilder(M);
+	llvm::DIBuilder dibuilder(*function.M);
 	//FIXME: hardcoded
 	llvm::DIFile *difile = dibuilder.createFile("sumDebug.cpp", "/home/franky/programming/github/llvm-jit-example_git");
 	//TODO: change bool when optimization is enabled
 	llvm::DICompileUnit *dicu = dibuilder.createCompileUnit(llvm::dwarf::DW_LANG_C, difile, "COAT", false, "", 0);
 
 	// IR types
-	llvm::Type *int64_type = llvm::Type::getInt64Ty(Context);
-	llvm::Type *int64_ptr_type = llvm::Type::getInt64PtrTy(Context);
+	llvm::Type *int64_type = llvm::Type::getInt64Ty(*function.Context);
+	llvm::Type *int64_ptr_type = llvm::Type::getInt64PtrTy(*function.Context);
 	// debug types
 	llvm::DIType *di_int64 = dibuilder.createBasicType("int64_t", 64, llvm::dwarf::DW_ATE_signed);
 	llvm::DIType *di_ptr_int64 = dibuilder.createPointerType(di_int64, 64, llvm::dwarf::DW_ATE_signed);
@@ -40,7 +99,7 @@ llvm::Function *generateFunction(llvm::LLVMContext &Context, llvm::Module &M){
 	// Signature of the generated function.
 	llvm::FunctionType *jit_func_type = llvm::FunctionType::get(int64_type, {int64_ptr_type, int64_type}, false);
 	// IR function definition
-	llvm::Function *jit_func = llvm::Function::Create(jit_func_type, llvm::Function::ExternalLinkage, "sumfunc", M);
+	llvm::Function *jit_func = llvm::Function::Create(jit_func_type, llvm::Function::ExternalLinkage, "sumfunc", function.M.get());
 
 	// debug definition of function
 	llvm::DISubprogram *disubprogram = dibuilder.createFunction(
@@ -53,9 +112,9 @@ llvm::Function *generateFunction(llvm::LLVMContext &Context, llvm::Module &M){
 	jit_func->setSubprogram(disubprogram);
 
 	// emit LLVM IR
-	llvm::BasicBlock *check_bb = llvm::BasicBlock::Create(Context, "check", jit_func);
-	llvm::BasicBlock *loop_bb = llvm::BasicBlock::Create(Context, "loop", jit_func);
-	llvm::BasicBlock *exit_bb = llvm::BasicBlock::Create(Context, "exit", jit_func);
+	llvm::BasicBlock *check_bb = llvm::BasicBlock::Create(*function.Context, "check", jit_func);
+	llvm::BasicBlock *loop_bb = llvm::BasicBlock::Create(*function.Context, "loop", jit_func);
+	llvm::BasicBlock *exit_bb = llvm::BasicBlock::Create(*function.Context, "exit", jit_func);
 	llvm::IRBuilder<> builder(check_bb);
 
 	// unset location for prologue
@@ -141,54 +200,13 @@ llvm::Function *generateFunction(llvm::LLVMContext &Context, llvm::Module &M){
 	// finalize debug information
 	dibuilder.finalize();
 
-	return jit_func;
+	function.jit_function = jit_func;
 }
 
 
-bool verifyFunction(llvm::Function *jit_func){
-	std::string str;
-	llvm::raw_string_ostream os(str);
-	bool failed = llvm::verifyFunction(*jit_func, &os);
-	if(failed){
-		fprintf(stderr, "\nfunction verifier:\n%s\n", os.str().c_str());
-	}
-	return !failed;
-}
 
-void printIR(const llvm::Module &M, const char *fname){
-	std::string str;
-	llvm::raw_string_ostream os(str);
-	M.print(os, nullptr);
-	std::ofstream of(fname);
-	of << os.str();
-}
 
-void optimize(int optLevel, llvm::Module *M, llvm::Function *function){
-	//TODO: use TransformLayer instead
-	llvm::PassManagerBuilder pm_builder;
-	pm_builder.OptLevel = optLevel;
-	pm_builder.SizeLevel = 0;
-	//pm_builder.Inliner = llvm::createAlwaysInlinerLegacyPass();
-	pm_builder.Inliner = llvm::createFunctionInliningPass(optLevel, 0, false);
-	pm_builder.LoopVectorize = true;
-	pm_builder.SLPVectorize = true;
 
-	//pm_builder.VerifyInput = true;
-	pm_builder.VerifyOutput = true;
-
-	llvm::legacy::FunctionPassManager function_pm(M);
-	llvm::legacy::PassManager module_pm;
-	pm_builder.populateFunctionPassManager(function_pm);
-	pm_builder.populateModulePassManager(module_pm);
-
-	function_pm.doInitialization();
-	//for(llvm::Function *f : functions){
-	//	function_pm.run(*f);
-	//}
-	function_pm.run(*function);
-
-	module_pm.run(*M);
-}
 
 int main(){
 	// initialize LLVM
@@ -199,23 +217,22 @@ int main(){
 	llvmjitrt llvmrt;
 	SumFunc fn=nullptr;
 	{ // scope to test life-cycles
-		auto Context = std::make_unique<llvm::LLVMContext>();
-		auto M = std::make_unique<llvm::Module>("test", *Context);
+		Function func;
 
-		llvm::Function *jit_func = generateFunction(*Context, *M);
+		generateFunction(func);
 
 		// print
-		printIR(*M, "sumDebug.ll");
+		func.printIR("sumDebug.ll");
 		// verify
-		verifyFunction(jit_func);
+		func.verify();
 
 #if 1
-		optimize(3, M.get(), jit_func);
+		func.optimize(3);
 		// print
-		printIR(*M, "sumDebug_opt.ll");
+		func.printIR("sumDebug_opt.ll");
 #endif
 
-		llvm::orc::ThreadSafeModule tsm(std::move(M), std::move(Context));
+		llvm::orc::ThreadSafeModule tsm(std::move(func.M), std::move(func.Context));
 		ExitOnErr(llvmrt.J->addIRModule(std::move(tsm)));
 		// Look up the JIT'd function
 		//auto SumSym = ExitOnErr(J->lookup("sumfunc"));
